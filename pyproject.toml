@@ -66,6 +66,13 @@ dependencies = [
 api = [
     "aiohttp>=3.9.0,<4.0.0",
 ]
+fastapi = [
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+]
+semantic = [
+    "sentence-transformers>=3.0.0,<6.0.0",
+]
 wecom = [
     "wecom-aibot-sdk-python>=0.1.5",
 ]
@@ -99,6 +106,11 @@ dev = [
     "pytest-cov>=6.0.0,<7.0.0",
     "ruff>=0.1.0",
     "pymupdf>=1.25.0",
+]
+
+mongodb = [
+    "motor>=3.3.0,<4.0.0",
+    "pymongo>=4.6.0,<5.0.0",
 ]
 
 [project.scripts]

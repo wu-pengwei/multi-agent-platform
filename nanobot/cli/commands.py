@@ -545,17 +545,29 @@ def serve(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show nanobot runtime logs"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    framework: str = typer.Option("aiohttp", "--framework", help="API framework: aiohttp or fastapi"),
 ):
     """Start the OpenAI-compatible API server (/v1/chat/completions)."""
-    try:
-        from aiohttp import web  # noqa: F401
-    except ImportError:
-        console.print("[red]aiohttp is required. Install with: pip install 'nanobot-ai[api]'[/red]")
-        raise typer.Exit(1)
+    if framework not in {"aiohttp", "fastapi"}:
+        console.print("[red]--framework must be either aiohttp or fastapi[/red]")
+        raise typer.Exit(2)
+    if framework == "aiohttp":
+        try:
+            from aiohttp import web  # noqa: F401
+        except ImportError:
+            console.print("[red]aiohttp is required. Install with: pip install 'nanobot-ai[api]'[/red]")
+            raise typer.Exit(1)
+    else:
+        try:
+            import uvicorn  # noqa: F401
+        except ImportError:
+            console.print("[red]FastAPI support is required. Install with: pip install 'nanobot-ai[fastapi]'[/red]")
+            raise typer.Exit(1)
 
     from loguru import logger
+    if framework == "aiohttp":
+        from aiohttp import web
     from nanobot.agent.loop import AgentLoop
-    from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
     from nanobot.session.manager import SessionManager
 
@@ -594,6 +606,7 @@ def serve(
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
         tools_config=runtime_config.tools,
+        semantic_config=runtime_config.agents.defaults.semantic,
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -608,6 +621,19 @@ def serve(
             "Only do this behind a trusted network boundary, firewall, or reverse proxy."
         )
     console.print()
+
+    if framework == "fastapi":
+        from nanobot.api.fastapi_server import create_fastapi_app
+
+        api_app = create_fastapi_app(
+            agent_loop, model_name=model_name, request_timeout=timeout
+        )
+        import uvicorn
+
+        uvicorn.run(api_app, host=host, port=port, log_config=None)
+        return
+
+    from nanobot.api.server import create_app
 
     api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
 
@@ -698,6 +724,7 @@ def _run_gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        semantic_config=config.agents.defaults.semantic,
     )
 
     # Set cron callback (needs agent)
@@ -1017,6 +1044,7 @@ def agent(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        semantic_config=config.agents.defaults.semantic,
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):

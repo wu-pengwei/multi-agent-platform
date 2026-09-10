@@ -14,6 +14,7 @@ from nanobot.agent.tools.schema import (
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronSchedule
 
+#给 AI 看的一份 “定时任务说明书”
 _CRON_PARAMETERS = tool_parameters_schema(
     action=StringSchema("Action to perform", enum=["add", "list", "remove"]),
     name=StringSchema(

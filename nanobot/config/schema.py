@@ -20,7 +20,7 @@ class ChannelsConfig(Base):
 
     Built-in and plugin channel configs are stored as extra fields (dicts).
     Each channel parses its own config in __init__.
-    Per-channel "streaming": true enables streaming output (requires send_delta impl).
+    Per-channel "streaing": true enables streaming output (requires send_delta impl).
     """
 
     model_config = ConfigDict(extra="allow")
@@ -65,6 +65,21 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class SemanticMemoryConfig(Base):
+    """Semantic memory recall configuration.
+
+    When enabled, consolidated history entries are embedded into a local
+    vector index (``memory/semantic_index.jsonl``) and the most relevant
+    ones are injected into the system prompt per turn — recall beyond the
+    fixed "Recent History" window and across sessions.
+    """
+
+    enabled: bool = False
+    # Local sentence-transformers model used for embeddings (same family as RAG).
+    embed_model: str = "all-MiniLM-L6-v2"
+    top_k: int = Field(default=5, ge=1, le=20)  # Max recalled memories injected per turn
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -91,6 +106,7 @@ class AgentDefaults(Base):
         serialization_alias="idleCompactAfterMinutes",
     )  # Auto-compact idle threshold in minutes (0 = disabled)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    semantic: SemanticMemoryConfig = Field(default_factory=SemanticMemoryConfig)
 
 
 class AgentsConfig(Base):
@@ -224,6 +240,22 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class MongoDBConfig(Base):
+    """MongoDB storage backend configuration.
+
+    Used to configure MongoDB (or MongoDB Atlas) as the storage
+    backend for history and semantic memory.
+    """
+
+    enabled: bool = False
+    uri: str = "mongodb://localhost:27017"
+    database: str = "nanobot"
+    history_collection: str = "history"
+    semantic_collection: str = "semantic_memory"
+    vector_index: str = "vector_index"  # Atlas Vector Search index name
+    fallback_to_file: bool = True  # Fallback to file store if MongoDB unavailable
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -233,6 +265,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    mongodb: MongoDBConfig = Field(default_factory=MongoDBConfig)
 
     @property
     def workspace_path(self) -> Path:

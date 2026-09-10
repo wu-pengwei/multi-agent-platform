@@ -1,1 +1,1 @@
-"""CLI module for nanobot."""
+"""CLI module for nanobot. 负责命令行交互工具"""

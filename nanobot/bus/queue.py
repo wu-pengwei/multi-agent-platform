@@ -1,4 +1,4 @@
-"""Async message queue for decoupled channel-agent communication."""
+"""Async message queue for decoupled channel-agent communication.负责“消息总线”，把聊天渠道和 agent 核心解耦。"""
 
 import asyncio
 

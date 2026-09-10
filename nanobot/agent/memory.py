@@ -6,19 +6,26 @@ import asyncio
 import json
 import re
 import weakref
-import tiktoken
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
+import tiktoken
 from loguru import logger
 
-from nanobot.utils.prompt_templates import render_template
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think, truncate_text
-
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.semantic_memory import SemanticMemory
+from nanobot.agent.storage.base import MemoryStorageBackend
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.utils.gitstore import GitStore
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    strip_think,
+    truncate_text,
+)
+from nanobot.utils.prompt_templates import render_template
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -26,7 +33,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# MemoryStore — pure file I/O layer
+# MemoryStore — pu re file I/O layer
 # ---------------------------------------------------------------------------
 
 class MemoryStore:
@@ -39,23 +46,148 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(
+        self,
+        workspace: Path,
+        max_history_entries: int = _DEFAULT_MAX_HISTORY,
+        storage_backend: Optional[MemoryStorageBackend] = None,
+    ):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "history.jsonl"
         self.legacy_history_file = self.memory_dir / "HISTORY.md"
         self.soul_file = workspace / "SOUL.md"
         self.user_file = workspace / "USER.md"
-        self._cursor_file = self.memory_dir / ".cursor"
-        self._dream_cursor_file = self.memory_dir / ".dream_cursor"
         self._corruption_logged = False  # rate-limit non-int cursor warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
+
+        # Storage backend (MongoDB, file-based, etc.)
+        self._storage = storage_backend
+        self._use_storage_backend = storage_backend is not None
+
+        # File paths (used only when not using storage backend)
+        if not self._use_storage_backend:
+            self.history_file = self.memory_dir / "history.jsonl"
+            self._cursor_file = self.memory_dir / ".cursor"
+            self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+        else:
+            # Use placeholder paths (won't be used)
+            self.history_file = self.memory_dir / "history.jsonl"
+            self._cursor_file = self.memory_dir / ".cursor"
+            self._dream_cursor_file = self.memory_dir / ".dream_cursor"
+
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md",
         ])
-        self._maybe_migrate_legacy_history()
+        # semantic store is optional and initialized by caller with an embed function
+        self.semantic_store: SemanticMemory | None = None
+
+        # Migrate legacy history only if using file storage
+        if not self._use_storage_backend:
+            self._maybe_migrate_legacy_history()
+
+    # -- Semantic memory helpers -------------------------------------------
+
+    def init_semantic(self, embed_func: Callable[[list[str]], list[list[float]]], *, dim: int | None = None) -> None:
+        """Initialize a simple JSONL-backed semantic memory index.
+
+        Args:
+            embed_func: callable(list[str]) -> list[list[float]] that returns embeddings.
+            dim: optional embedding dimension; inferred on first add if omitted.
+        """
+        semantic_path = self.memory_dir / "semantic_index.jsonl"
+        self.semantic_store = SemanticMemory(semantic_path, embed_func, dim=dim)
+
+    async def semantic_add_documents(self, docs: list[dict[str, Any]]) -> list[str]:
+        """Add documents (each must have `text`) to semantic store. Returns ids."""
+        if not self.semantic_store:
+            raise RuntimeError("Semantic store not initialized. Call init_semantic() first.")
+        return await self.semantic_store.add_documents(docs)
+
+    async def semantic_query(self, query_text: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """Query semantic store and return top_k entries."""
+        if not self.semantic_store:
+            return []
+        return await self.semantic_store.query(query_text, top_k=top_k)
+
+    async def get_semantic_context(self, query_text: str, top_k: int = 5) -> str:
+        """Return a concatenated context block from semantic nearest neighbors."""
+        results = await self.semantic_query(query_text, top_k=top_k)
+        if not results:
+            return ""
+        lines = ["## Semantic Memories"]
+        for r in results:
+            text = r.get("text", "")
+            meta = r.get("metadata") or {}
+            lines.append(f"- {truncate_text(text, 1000)}")
+            if meta:
+                lines.append(f"  - meta: {meta}")
+        return "\n".join(lines)
+
+    def _recent_history_visible_cursors(self) -> set[int] | None:
+        """Cursors already shown in the system prompt's Recent History section.
+
+        That section renders the last ``ContextBuilder._MAX_RECENT_HISTORY``
+        unprocessed entries (cursor > dream cursor). Recall results whose
+        cursor is in that window would be duplicated in the prompt, so they
+        are filtered out. Returns None when the set cannot be determined
+        (dedup is skipped rather than guessed).
+        """
+        try:
+            dream_cursor = self.get_last_dream_cursor()
+            unprocessed = self.read_unprocessed_history(dream_cursor)
+            visible = unprocessed[-50:]
+            return {
+                e["cursor"] for e in visible
+                if isinstance(e.get("cursor"), int) and not isinstance(e.get("cursor"), bool)
+            }
+        except Exception:
+            return None
+
+    def get_semantic_context_sync(self, query_text: str, top_k: int = 5) -> str:
+        """Synchronous semantic recall for prompt injection.
+
+        Same shape as :meth:`get_semantic_context`, but driven by a sync
+        embed function so ContextBuilder can call it while building the
+        prompt. Overfetches to compensate for the Recent History dedup
+        filter. Returns "" whenever semantic recall is unavailable.
+        """
+        store = self.semantic_store
+        if store is None or not query_text.strip():
+            return ""
+        try:
+            results = store.query_sync(query_text, top_k=max(top_k * 3, top_k))
+        except Exception:
+            logger.debug("Semantic recall query failed", exc_info=True)
+            return ""
+        if not results:
+            return ""
+        visible = self._recent_history_visible_cursors()
+        kept = []
+        for r in results:
+            meta = r.get("metadata") or {}
+            raw_cursor = meta.get("cursor")
+            if (
+                visible is not None
+                and isinstance(raw_cursor, int)
+                and not isinstance(raw_cursor, bool)
+                and raw_cursor in visible
+            ):
+                continue  # already rendered in Recent History this turn
+            kept.append(r)
+            if len(kept) >= top_k:
+                break
+        if not kept:
+            return ""
+        lines = ["## Semantic Memories"]
+        for r in kept:
+            text = r.get("text", "")
+            meta = r.get("metadata") or {}
+            ts = meta.get("timestamp")
+            prefix = f"[{ts}] " if ts else ""
+            lines.append(f"- {prefix}{truncate_text(text, 600)}")
+        return "\n".join(lines)
 
     @property
     def git(self) -> GitStore:
@@ -224,7 +356,7 @@ class MemoryStore:
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
     def append_history(self, entry: str, *, max_chars: int | None = None) -> int:
-        """Append *entry* to history.jsonl and return its auto-incrementing cursor.
+        """Append *entry* to history and return its auto-incrementing cursor.
 
         Entries are passed through `strip_think` to drop template-level leaks
         (e.g. unclosed `<think` prefixes, `<channel|>` markers) before being
@@ -239,8 +371,6 @@ class MemoryStore:
         large writes (e.g. an LLM echoing its input back as a "summary").
         """
         limit = max_chars if max_chars is not None else _HISTORY_ENTRY_HARD_CAP
-        cursor = self._next_cursor()
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         raw = entry.rstrip()
         if len(raw) > limit:
             if not self._oversize_logged:
@@ -255,15 +385,46 @@ class MemoryStore:
         content = strip_think(raw)
         if raw and not content:
             logger.debug(
-                "history entry {} stripped to empty (likely template leak); "
-                "persisting empty content to avoid re-polluting context",
-                cursor,
+                "history entry stripped to empty (likely template leak); "
+                "persisting empty content to avoid re-polluting context"
             )
+
+        # Use storage backend if available
+        if self._use_storage_backend and self._storage:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            record = {"timestamp": ts, "content": content}
+            cursor = asyncio.get_event_loop().run_until_complete(
+                self._storage.append_history(record)
+            )
+            return cursor
+
+        # Fallback to file-based storage
+        cursor = self._next_cursor()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         record = {"cursor": cursor, "timestamp": ts, "content": content}
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._cursor_file.write_text(str(cursor), encoding="utf-8")
+        self._index_semantic_entry(content, cursor, ts)
         return cursor
+
+    def _index_semantic_entry(self, content: str, cursor: int, timestamp: str) -> None:
+        """Best-effort semantic indexing of a new history entry.
+
+        Failures never propagate — history persistence must not be blocked by
+        the optional recall index. The cursor is stored as entry metadata so
+        recall can skip entries already visible in the Recent History section
+        (see get_semantic_context_sync).
+        """
+        if not content or self.semantic_store is None:
+            return
+        try:
+            self.semantic_store.add_documents_sync([{
+                "text": content,
+                "metadata": {"cursor": cursor, "timestamp": timestamp},
+            }])
+        except Exception:
+            logger.debug("Semantic indexing failed for cursor {}", cursor, exc_info=True)
 
     @staticmethod
     def _valid_cursor(value: Any) -> int | None:
@@ -310,10 +471,27 @@ class MemoryStore:
 
     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
         """Return history entries with a valid cursor > *since_cursor*."""
+        # Use storage backend if available
+        if self._use_storage_backend and self._storage:
+            return asyncio.get_event_loop().run_until_complete(
+                self._storage.read_history(since_cursor=since_cursor, limit=10000)
+            )
+
+        # Fallback to file-based storage
         return [e for e, c in self._iter_valid_entries() if c > since_cursor]
 
     def compact_history(self) -> None:
-        """Drop oldest entries if the file exceeds *max_history_entries*."""
+        """Drop oldest entries if the file exceeds *max_history_entries*.
+
+        Note: When using a storage backend (e.g., MongoDB), this method
+        is a no-op. Compaction should be handled by the backend
+        (e.g., TTL indexes in MongoDB).
+        """
+        # Skip compaction when using storage backend
+        if self._use_storage_backend:
+            logger.debug("Skipping history compaction (using storage backend)")
+            return
+
         if self.max_history_entries <= 0:
             return
         entries = self._read_entries()
@@ -351,7 +529,7 @@ class MemoryStore:
                 read_size = min(size, 4096)
                 f.seek(size - read_size)
                 data = f.read().decode("utf-8")
-                lines = [l for l in data.split("\n") if l.strip()]
+                lines = [line for line in data.split("\n") if line.strip()]
                 if not lines:
                     return None
                 return json.loads(lines[-1])
@@ -367,6 +545,14 @@ class MemoryStore:
     # -- dream cursor --------------------------------------------------------
 
     def get_last_dream_cursor(self) -> int:
+        """Get the last processed dream cursor."""
+        # Use storage backend if available
+        if self._use_storage_backend and self._storage:
+            return asyncio.get_event_loop().run_until_complete(
+                self._storage.get_dream_cursor()
+            )
+
+        # Fallback to file-based storage
         if self._dream_cursor_file.exists():
             try:
                 return int(self._dream_cursor_file.read_text(encoding="utf-8").strip())
@@ -375,6 +561,15 @@ class MemoryStore:
         return 0
 
     def set_last_dream_cursor(self, cursor: int) -> None:
+        """Persist the last processed dream cursor."""
+        # Use storage backend if available
+        if self._use_storage_backend and self._storage:
+            asyncio.get_event_loop().run_until_complete(
+                self._storage.set_dream_cursor(cursor)
+            )
+            return
+
+        # Fallback to file-based storage
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
 
     # -- message formatting utility ------------------------------------------
@@ -740,7 +935,7 @@ class Dream:
 
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
-        _DESC_RE = _re.compile(r"^description:\s*(.+)$", _re.MULTILINE | _re.IGNORECASE)
+        desc_re = _re.compile(r"^description:\s*(.+)$", _re.MULTILINE | _re.IGNORECASE)
         entries: dict[str, str] = {}
         for base in (self.store.workspace / "skills", BUILTIN_SKILLS_DIR):
             if not base.exists():
@@ -755,7 +950,7 @@ class Dream:
                 if d.name in entries and base == BUILTIN_SKILLS_DIR:
                     continue
                 content = skill_md.read_text(encoding="utf-8")[:500]
-                m = _DESC_RE.search(content)
+                m = desc_re.search(content)
                 desc = m.group(1).strip() if m else "(no description)"
                 entries[d.name] = desc
         return [f"{name} — {desc}" for name, desc in sorted(entries.items())]

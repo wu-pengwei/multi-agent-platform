@@ -1,4 +1,5 @@
-"""Cron service for scheduling agent tasks."""
+"""Cron servic e for scheduling agent tasks.  定时任务服务，按计划自动触发 agent 或系统事件
+Cron:根据任务定义的时间计算下一次运行时间,系统主动在指定时间点触发。"""
 
 import asyncio
 import json

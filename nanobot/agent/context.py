@@ -1,16 +1,44 @@
 """Context builder for assembling agent prompts."""
 
+from __future__ import annotations
+
 import base64
 import mimetypes
 import platform
 from importlib.resources import files as pkg_files
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
-from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime, truncate_text
+from nanobot.utils.helpers import (
+    build_assistant_message,
+    current_time_str,
+    detect_image_mime,
+    truncate_text,
+)
 from nanobot.utils.prompt_templates import render_template
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import SemanticMemoryConfig
+
+
+def _load_local_embed_func(model_name: str):
+    """Load a local sentence-transformers embed function (lazy, heavy import).
+
+    Kept as a module-level factory so tests can monkeypatch it without
+    pulling in torch.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    st = SentenceTransformer(model_name)
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        return st.encode(texts, show_progress_bar=False).tolist()
+
+    return embed
 
 
 class ContextBuilder:
@@ -27,11 +55,55 @@ class ContextBuilder:
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
+        self._semantic_top_k: int = 5
+
+    def init_semantic_memory(self, config: SemanticMemoryConfig | None) -> bool:
+        """Enable query-aware semantic memory recall with a local embed model.
+
+        Returns True when recall is active. Degrades gracefully (returns
+        False with a single warning) when the embed runtime is missing or
+        fails to load — the agent keeps working with file-based memory only.
+        """
+        if config is None or not config.enabled:
+            return False
+        try:
+            embed_func = _load_local_embed_func(config.embed_model)
+        except Exception as e:
+            logger.warning(
+                "Semantic memory enabled but the embed model could not be loaded ({}). "
+                "Recall disabled; install with: pip install 'nanobot-ai[semantic]'.",
+                e,
+            )
+            return False
+        self.memory.init_semantic(embed_func)
+        self._semantic_top_k = config.top_k
+        logger.info(
+            "Semantic memory recall enabled (embed={}, top_k={})",
+            config.embed_model, config.top_k,
+        )
+        return True
+
+    def _semantic_recall(self, current_message: str) -> str | None:
+        """Recall semantically relevant memories for the current turn.
+
+        Returns None whenever recall is unavailable (store not initialized,
+        empty query, or any failure) — prompt building must never break.
+        """
+        if self.memory.semantic_store is None or not current_message.strip():
+            return None
+        try:
+            return self.memory.get_semantic_context_sync(
+                current_message, top_k=self._semantic_top_k,
+            ) or None
+        except Exception:
+            logger.debug("Semantic recall failed", exc_info=True)
+            return None
 
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        semantic_context: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
@@ -43,6 +115,11 @@ class ContextBuilder:
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
             parts.append(f"# Memory\n\n{memory}")
+
+        if semantic_context:
+            # Query-aware recall: relevant memories beyond the fixed
+            # Recent History window (and across sessions), selected per turn.
+            parts.append(semantic_context)
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -150,8 +227,11 @@ class ContextBuilder:
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
+        semantic_ctx = self._semantic_recall(current_message)
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {"role": "system", "content": self.build_system_prompt(
+                skill_names, channel=channel, semantic_context=semantic_ctx,
+            )},
             *history,
         ]
         if messages[-1].get("role") == current_role:

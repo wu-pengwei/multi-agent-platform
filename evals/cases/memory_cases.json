@@ -1,0 +1,30 @@
+{
+  "name": "long_horizon_memory",
+  "description": "24-turn cross-session memory recall cases",
+  "turns": [
+    {"turn": 1, "user": "我的项目代号是 Atlas，请记住。", "expected_in": ["Atlas"]},
+    {"turn": 2, "user": "我主要使用 Python 3.11。", "expected_in": ["Python 3.11"]},
+    {"turn": 3, "user": "我的工作目录是 D:/workspace/atlas。", "expected_in": ["D:/workspace/atlas"]},
+    {"turn": 4, "user": "我偏好的数据库是 PostgreSQL。", "expected_in": ["PostgreSQL"]},
+    {"turn": 5, "user": "我习惯用 pytest 写测试。", "expected_in": ["pytest"]},
+    {"turn": 6, "user": "我通常在 UTC+8 时区工作。", "expected_in": ["UTC+8"]},
+    {"turn": 7, "user": "Atlas 的生产环境运行在 Linux。", "expected_in": ["Linux"]},
+    {"turn": 8, "user": "请暂时不要保存我的银行卡号。", "expected_in": ["不要保存"]},
+    {"turn": 9, "user": "我喜欢简洁的中文回答。", "expected_in": ["简洁", "中文"]},
+    {"turn": 10, "user": "服务默认端口是 8080。", "expected_in": ["8080"]},
+    {"turn": 11, "user": "我们使用 Redis 做缓存。", "expected_in": ["Redis"]},
+    {"turn": 12, "user": "部署通过 Docker 完成。", "expected_in": ["Docker"]},
+    {"turn": 13, "user": "代码仓库的主分支叫 main。", "expected_in": ["main"]},
+    {"turn": 14, "user": "发布流程需要先跑 lint。", "expected_in": ["lint"]},
+    {"turn": 15, "user": "错误日志保留 30 天。", "expected_in": ["30 天"]},
+    {"turn": 16, "user": "告警发送到 engineering@example.com。", "expected_in": ["engineering@example.com"]},
+    {"turn": 17, "user": "我不希望回答中出现银行卡、密码等敏感信息。", "expected_in": ["敏感信息"]},
+    {"turn": 18, "user": "请记住 Atlas 使用 PostgreSQL 和 Redis。", "expected_in": ["PostgreSQL", "Redis"]},
+    {"turn": 19, "user": "现在只讨论旅行，不要提及 Atlas。", "expected_in": ["旅行"], "expected_not_in": ["银行卡号", "密码"]},
+    {"turn": 20, "user": "切换到 Atlas 项目，当前运行环境是什么？", "expected_in": ["Linux", "Atlas"]},
+    {"turn": 21, "user": "Atlas 的数据库和缓存分别是什么？", "expected_in": ["PostgreSQL", "Redis"]},
+    {"turn": 22, "user": "我用什么语言和测试框架？", "expected_in": ["Python", "pytest"]},
+    {"turn": 23, "user": "服务端口和部署方式是什么？", "expected_in": ["8080", "Docker"]},
+    {"turn": 24, "user": "请用我偏好的风格给出发布检查清单。", "expected_in": ["简洁", "中文"], "expected_not_in": ["银行卡号", "密码"]}
+  ]
+}

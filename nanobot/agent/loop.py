@@ -10,6 +10,8 @@ import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+#
+from nanobot.agent.tools.rag import RAGIndexTool, RAGSearchTool
 
 from loguru import logger
 
@@ -48,7 +50,13 @@ from nanobot.utils.progress_events import (
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, ToolsConfig, WebToolsConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        SemanticMemoryConfig,
+        ToolsConfig,
+        WebToolsConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -187,6 +195,7 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
+        semantic_config: SemanticMemoryConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -221,6 +230,7 @@ class AgentLoop:
         self._extra_hooks: list[AgentHook] = hooks or []
 
         self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.semantic_memory_enabled = self.context.init_semantic_memory(semantic_config)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.runner = AgentRunner(provider)
@@ -292,6 +302,10 @@ class AgentLoop:
                 workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read
             )
         )
+        #
+        self.tools.register(RAGIndexTool())
+        self.tools.register(RAGSearchTool())
+        #
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
         for cls in (GlobTool, GrepTool):
